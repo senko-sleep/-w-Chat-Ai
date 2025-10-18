@@ -2,12 +2,11 @@ import os, time, json, gzip, socket, hashlib, asyncio, subprocess
 from datetime import datetime
 from typing import Any, Dict, List, Tuple
 import numpy as np, psutil, aiofiles, ollama
-import concurrent.futures  # For potential future batching
+import concurrent.futures
 
-# Set Ollama env vars for speed (from optimizations)
 os.environ['OLLAMA_NUM_THREADS'] = str(os.cpu_count() or 4)
-os.environ['OLLAMA_MAX_LOADED'] = '1'  # Single model focus
-os.environ['OLLAMA_KEEP_ALIVE'] = '30m'  # Keep model loaded longer
+os.environ['OLLAMA_MAX_LOADED'] = '1'
+os.environ['OLLAMA_KEEP_ALIVE'] = '30m'
 
 def truncate(text: str, max_len: int) -> str:
     return text[:max_len] + ("..." if len(text) > max_len else "")
@@ -49,26 +48,22 @@ def ensure_ollama_running(wait_seconds: float = 6.0):
         if is_port_open(host, port): return
         time.sleep(0.25)
     print("[Warn] ollama did not open port within timeout.")
-    # Preload a dummy request to warm up the model after start
     try:
-        ollama.generate(model="tinyllama", prompt=" ")  # Fallback to tinyllama for preload if available
+        ollama.generate(model="tinyllama", prompt=" ")
     except: pass
 
-# Helper to pull model if not found (with user prompt)
 async def ensure_model_loaded(model_name: str):
     try:
-        # Test if model is loaded
         ollama.show(model_name)
         return
     except ollama.ResponseError as e:
         if e.status_code in (404, 500):
-            print(f"[Info] Model '{model_name}' not found. Pulling it now... (this may take a few minutes)")
+            print(f"[Info] Model '{model_name}' not found. Pulling it now...")
             try:
                 ollama.pull(model_name)
                 print(f"[Success] Pulled '{model_name}' successfully.")
             except Exception as pull_e:
-                print(f"[Error] Failed to pull '{model_name}': {pull_e}. Falling back to 'tinyllama'. Run 'ollama pull {model_name}' manually if needed.")
-                # Set to fallback
+                print(f"[Error] Failed to pull '{model_name}': {pull_e}. Falling back to 'tinyllama'.")
                 global fallback_model_global
                 fallback_model_global = "tinyllama"
                 return
@@ -77,14 +72,13 @@ async def ensure_model_loaded(model_name: str):
     except Exception as e:
         print(f"[Warn] Could not verify/pull model '{model_name}': {e}")
 
-# Global fallback for model issues
 fallback_model_global = None
 
 class SimpleEmbeddings:
-    def __init__(self, use_embeddings: bool = False, dim: int = 384):  # Smaller dim for speed (nomic supports 384)
+    def __init__(self, use_embeddings: bool = False, dim: int = 384):
         self.use, self.dim = use_embeddings, dim
         self.cache: Dict[str, np.ndarray] = {}
-        self.max_cache = 100  # Larger cache for fewer recomputes
+        self.max_cache = 100
 
     def get(self, text: str) -> np.ndarray:
         if not self.use: return np.zeros(self.dim, dtype=np.float32)
@@ -112,7 +106,6 @@ class LowMemMemory:
         self.file, self.live, self.stored = file, [], []
         self.max_live, self.max_stored, self.emb_pairs = 40, 150, []
         self.max_emb_pairs, self.embedding_disabled = 60, False
-        # CHANGE: Don't call load in __init__ to avoid sync/async mismatch; defer to async init
 
     def add(self, user: str, ai: str, emb: np.ndarray = None):
         user, ai = truncate(user, 200), truncate(ai, 200)
@@ -123,7 +116,7 @@ class LowMemMemory:
             self.emb_pairs.append((emb, rec))
             if len(self.emb_pairs) > self.max_emb_pairs: self.emb_pairs.pop(0)
 
-    def get_relevant(self, q_emb: np.ndarray, top: int = 3) -> List[Dict[str,str]]:  # top=3 for smarter retrieval
+    def get_relevant(self, q_emb: np.ndarray, top: int = 3) -> List[Dict[str,str]]:
         if q_emb is None or q_emb.size == 0 or not self.emb_pairs: return []
         scored = sorted(((SimpleEmbeddings.cosine(q_emb, e), r) for e, r in self.emb_pairs), key=lambda x: -x[0])
         return [r for _, r in scored[:top]]
@@ -138,19 +131,19 @@ class LowMemMemory:
         except Exception as e:
             print(f"[Error] save memory: {e}")
 
-    async def load(self):  # Async load to handle aiofiles
+    async def load(self):
         if not os.path.exists(self.file): return
         try:
             async with aiofiles.open(self.file, "rb") as f:
                 raw = await f.read()
-                if not raw:  # Empty file handling
+                if not raw:
                     print("[Warn] Memory file empty, starting fresh.")
                     return
                 data = decompress_json(raw)
             self.stored = data.get("stored", [])[-self.max_stored:]
             print(f"📂 loaded {len(self.stored)} saved interactions")
         except json.JSONDecodeError as e:
-            print(f"[Warn] Corrupt memory file (JSON error): {e}. Deleting and starting fresh.")
+            print(f"[Warn] Corrupt memory file: {e}. Deleting and starting fresh.")
             try: os.remove(self.file)
             except Exception: pass
             self.stored = []
@@ -162,9 +155,7 @@ class LowMemMemory:
 
 class EnhancedOllamaChat:
     def __init__(self, model: str = None, use_embeddings: bool = False):
-        self.model = model or os.getenv("OLLAMA_MODEL", "llama3.2:3b")  # CHANGE: Reliable default (fast, accurate; pull if needed)
-        # CHANGE: Simplified quant: No auto-append; assume user specifies valid tag (e.g., llama3.2:3b-instruct-q4_0)
-        # List available models to validate
+        self.model = model or os.getenv("OLLAMA_MODEL", "llama3.2:3b")
         try:
             available = [m['name'] for m in ollama.list().get('models', [])]
             if self.model not in available:
@@ -174,7 +165,7 @@ class EnhancedOllamaChat:
                 else:
                     self.model = "tinyllama"
         except Exception:
-            pass  # Proceed, ensure_model will handle
+            pass
         self.client = ollama.Client()
         self.memory = LowMemMemory()
         self.emb = SimpleEmbeddings(use_embeddings=use_embeddings)
@@ -185,17 +176,13 @@ class EnhancedOllamaChat:
                     self.system_prompt = f.read().strip()
             except Exception: pass
         else:
-            # CHANGE: Enhanced fallback prompt with Pokémon fact and stronger anti-hallucination
             self.system_prompt = """You are a helpful, accurate AI assistant. Think step-by-step before responding to ensure logical and factual answers.
 Base responses on verified knowledge. If uncertain, state limitations clearly. Use concise, structured outputs when appropriate (e.g., lists for facts).
 For factual queries, prioritize precision over speculation. Ignore prior inconsistencies and correct errors. Do not continue previous topics unless directly related.
-Key facts: Eevee (Pokémon) is National Dex #133, Normal-type, evolves into Vaporeon, Jolteon, Flareon, Espeon, Umbreon, Leafeon, Glaceon, Sylveon.
-Examples:
-User: What is 2+2? → Assistant: 2 + 2 = 4 (simple math).
-User: What is the Pokémon Eevee's Dex number? → Assistant: Eevee's National Pokédex number is #133."""
+Key facts: Eevee (Pokémon) is National Dex #133, Normal-type, evolves into Vaporeon, Jolteon, Flareon, Espeon, Umbreon, Leafeon, Glaceon, Sylveon."""
         print(f"OllamaChat initialized: model={self.model} embeddings={'on' if self.emb.use else 'off'}")
 
-    async def __aenter__(self):  # Allow async init to pull model and load memory
+    async def __aenter__(self):
         await ensure_model_loaded(self.model)
         if fallback_model_global:
             self.model = fallback_model_global
@@ -212,34 +199,28 @@ User: What is the Pokémon Eevee's Dex number? → Assistant: Eevee's National P
             msgs.append({"role":"system","content":truncate("Recent: "+summary, 200)})
         if self.emb.use:
             q_emb = self.emb.get(query)
-            relevant = self.memory.get_relevant(q_emb, top=3)  # Now uses top=3
+            relevant = self.memory.get_relevant(q_emb, top=3)
             for r in relevant:
                 msgs.append({"role":"system","content":truncate(f"Relevant prior: U: {r['user_message']} A: {r['ai_response']}", 200)})
-        
-        # CHANGE: For factual queries, NO history to prevent topic pollution (e.g., Undertale bleeding into Pokémon)
-        # Only add history for conversational/non-factual
         factual_keywords = ["what", "who", "dex number", "define", "is", "how many", "explain"]
         is_factual = any(kw in query.lower() for kw in factual_keywords)
         if not is_factual:
-            # Full pairs for conversational
-            for r in self.memory.live[-2:]:  # Reduced from -4:
+            for r in self.memory.live[-2:]:
                 msgs.append({"role":"user","content":truncate(r["user_message"],200)})
                 msgs.append({"role":"assistant","content":truncate(r["ai_response"],200)})
-        
         msgs.append({"role":"user","content":truncate(query, 1000)})
         return msgs
 
     async def chat(self, query: str) -> str:
         try:
             msgs = self.build_messages(query)
-            if sum(len(m.get("content","")) for m in msgs) > 8000: msgs = msgs[-4:]  # Reduced for smaller model context
+            if sum(len(m.get("content","")) for m in msgs) > 8000: msgs = msgs[-4:]
             print("🤖 AI:", end=" ", flush=True)
             response_parts, start = [], time.time()
-            # Add num_ctx=2048 for faster inference, num_thread for CPU speed
             options = {
                 "num_predict": 192,
-                "temperature": 0.4,  # Lower for more consistent/accurate responses
-                "num_ctx": 2048,  # Smaller context for speed
+                "temperature": 0.4,
+                "num_ctx": 2048,
                 "num_thread": os.cpu_count() or 4
             }
             stream = self.client.chat(model=self.model, messages=msgs, stream=True, options=options)
@@ -258,14 +239,13 @@ User: What is the Pokémon Eevee's Dex number? → Assistant: Eevee's National P
             return full if full else "[No response]"
         except ollama.ResponseError as e:
             if e.status_code == 404:
-                print(f"\n[Error] Model '{self.model}' still not available. Try 'ollama pull {self.model}' manually.")
-                return f"[Error] Model not found: {self.model}. Run 'ollama pull {self.model}' to install."
+                print(f"\n[Error] Model '{self.model}' still not available.")
+                return f"[Error] Model not found: {self.model}."
             err = f"[Error] Ollama chat failed: {e}"
             print("\n" + err)
             try:
-                # Fixed fallback parsing; try tinyllama first
                 fallback_model = "tinyllama"
-                options = {"num_predict":128, "num_ctx": 1024}  # Even smaller for fallback speed
+                options = {"num_predict":128, "num_ctx": 1024}
                 resp = self.client.chat(model=fallback_model, messages=[{"role":"user","content":truncate(query,1000)}],
                                         stream=False, options=options)
                 text = resp.get("message", {}).get("content", "")
@@ -326,7 +306,7 @@ async def main():
     model = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
     use_emb = os.getenv("USE_EMB", "0") == "1"
     chat = EnhancedOllamaChat(model=model, use_embeddings=use_emb)
-    await chat.__aenter__()  # Async init to pull model and load memory
+    await chat.__aenter__()
     await chat.run()
 
 if __name__ == "__main__":

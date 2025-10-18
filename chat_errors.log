@@ -1,0 +1,1 @@
+2025-10-17 21:30:55.108089: [Error] Ollama chat failed: model 'qwen2.5:7b-q4_0' not found (status code: 404) | fallback failed: model 'qwen2.5:7b-q4_0' not found (status code: 404)
